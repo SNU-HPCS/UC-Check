@@ -1,0 +1,168 @@
+diff --git a/hotspot/src/share/vm/code/codeBlob.cpp b/hotspot/src/share/vm/code/codeBlob.cpp
+index 5038b08c1c..86a86f1f92 100644
+--- a/hotspot/src/share/vm/code/codeBlob.cpp
++++ b/hotspot/src/share/vm/code/codeBlob.cpp
+@@ -118,7 +118,8 @@ CodeBlob::CodeBlob(
+   int         size,
+   int         frame_complete,
+   int         frame_size,
+-  OopMapSet*  oop_maps
++  OopMapSet*  oop_maps,
++  int uc_modify_mode
+ ) {
+   assert(size        == round_to(size,        oopSize), "unaligned size");
+   assert(header_size == round_to(header_size, oopSize), "unaligned size");
+@@ -129,6 +130,52 @@ CodeBlob::CodeBlob(
+   _header_size           = header_size;
+   _relocation_size       = round_to(cb->total_relocation_size(), oopSize);
+   _content_offset        = align_code_offset(header_size + _relocation_size);
++  // fill buffer between relocation and codeSections
++  // Increase content_offset by awaring UC set alignment
++  if ((uc_modify_mode == 0) || (uc_modify_mode == 1)) {
++    address tmp_code_addr = header_begin() + _content_offset + cb->total_offset_of(cb->insts());
++    int tmp_code_addr_setIdx = (int)(((uint64_t)tmp_code_addr / UopCacheWindowSize) % UopCacheSetCount);
++
++    if (uc_modify_mode == 0) {
++      if (UCTargetSetParm >= 0) {
++        // (debugging purpose // check the availability of forcing UC set index)
++        int targetUCset = (int)UCTargetSetParm % (int)UopCacheSetCount;
++        int filling_setCount = (targetUCset >= tmp_code_addr_setIdx) ?
++                (targetUCset - tmp_code_addr_setIdx) :
++                (targetUCset - tmp_code_addr_setIdx + (int)UopCacheSetCount);
++        assert(filling_setCount >= 0 && filling_setCount < (int)UopCacheSetCount, "invalid filling_setCount");
++        _content_offset += (filling_setCount * (int)UopCacheWindowSize);
++        _content_offset = align_code_offset(_content_offset);
++      }
++    } else if (uc_modify_mode == 1) {
++      // isolation type
++      //  -1: default (do nothing)
++      //   0: forcing the start addresses of compiled codes in the first-half region
++      //   1: forcing the start addresses of compiled codes in the second-half region
++      if ((UCIsolationType == 0) || (UCIsolationType == 1)) {
++        int code_size = (int)(round_to(cb->total_content_size(), oopSize) - cb->total_offset_of(cb->insts()));
++        assert(code_size >= 0, "Minus code size is not allowed");
++        int code_set_count = code_size / (int)UopCacheWindowSize;
++        int targetUCset;
++        if (code_set_count >= UopCacheSetCount / 2) {
++          // a given code is larger than a half of UC sets => start from the first entry
++          targetUCset = (int)UCIsolationType * ((int)UopCacheSetCount / 2);
++        } else {
++          // [0] ~ [UopCacheSetCount/2 - code_set_count]
++          targetUCset = (int)UCIsolationType * ((int)UopCacheSetCount / 2) +
++                  (rand() % ((int)UopCacheSetCount / 2 - code_set_count));
++        }
++        assert(targetUCset >= 0 && targetUCset < (int)UopCacheSetCount, "Invalid targetUCset");
++        int filling_setCount = (targetUCset >= tmp_code_addr_setIdx) ?
++                (targetUCset - tmp_code_addr_setIdx) :
++                (targetUCset - tmp_code_addr_setIdx + (int)UopCacheSetCount);
++        assert(filling_setCount >= 0 && filling_setCount < (int)UopCacheSetCount, "invalid filling_setCount");
++        _content_offset += (filling_setCount * (int)UopCacheWindowSize);
++        _content_offset = align_code_offset(_content_offset);
++      }
++    }
++  }
++
+   _code_offset           = _content_offset + cb->total_offset_of(cb->insts());
+   _data_offset           = _content_offset + round_to(cb->total_content_size(), oopSize);
+   assert(_data_offset <= size, "codeBlob is too small");
+diff --git a/hotspot/src/share/vm/code/codeBlob.hpp b/hotspot/src/share/vm/code/codeBlob.hpp
+index b9b1458fd1..b634b2f4f9 100644
+--- a/hotspot/src/share/vm/code/codeBlob.hpp
++++ b/hotspot/src/share/vm/code/codeBlob.hpp
+@@ -96,7 +96,8 @@ class CodeBlob VALUE_OBJ_CLASS_SPEC {
+     int         size,
+     int         frame_complete,
+     int         frame_size,
+-    OopMapSet*  oop_maps
++    OopMapSet*  oop_maps,
++    int uc_modify_mode = -1
+   );
+ 
+   // Deletion
+diff --git a/hotspot/src/share/vm/code/nmethod.cpp b/hotspot/src/share/vm/code/nmethod.cpp
+index 9e4edf3428..2078f238da 100644
+--- a/hotspot/src/share/vm/code/nmethod.cpp
++++ b/hotspot/src/share/vm/code/nmethod.cpp
+@@ -604,6 +604,7 @@ nmethod* nmethod::new_nmethod(methodHandle method,
+   { MutexLockerEx mu(CodeCache_lock, Mutex::_no_safepoint_check_flag);
+     int nmethod_size =
+       allocation_size(code_buffer, sizeof(nmethod))
++      + UopCacheSetCount * UopCacheWindowSize   // buffer for UC set alignment (too much waste // need to be improved)
+       + adjust_pcs_size(debug_info->pcs_size())
+       + round_to(dependencies->size_in_bytes() , oopSize)
+       + round_to(handler_table->size_in_bytes(), oopSize)
+@@ -617,7 +618,8 @@ nmethod* nmethod::new_nmethod(methodHandle method,
+             handler_table,
+             nul_chk_table,
+             compiler,
+-            comp_level);
++            comp_level,
++            UCModifyMode);
+ 
+     if (nm != NULL) {
+       // To make dependency checking during class loading fast, record
+@@ -847,10 +849,10 @@ nmethod::nmethod(
+   ExceptionHandlerTable* handler_table,
+   ImplicitExceptionTable* nul_chk_table,
+   AbstractCompiler* compiler,
+-  int comp_level
+-  )
++  int comp_level,
++  int uc_modify_mode)
+   : CodeBlob("nmethod", code_buffer, sizeof(nmethod),
+-             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, oop_maps),
++             nmethod_size, offsets->value(CodeOffsets::Frame_Complete), frame_size, oop_maps, uc_modify_mode),
+   _native_receiver_sp_offset(in_ByteSize(-1)),
+   _native_basic_lock_sp_offset(in_ByteSize(-1))
+ {
+@@ -965,7 +967,7 @@ void nmethod::log_new_nmethod() const {
+     HandleMark hm;
+     xtty->begin_elem("nmethod");
+     log_identity(xtty);
+-    xtty->print(" entry='" INTPTR_FORMAT "' size='%d'", code_begin(), size());
++    xtty->print(" entry='" INTPTR_FORMAT "' size='%d' code_size='%d'", code_begin(), size(), code_size());
+     xtty->print(" address='" INTPTR_FORMAT "'", (intptr_t) this);
+ 
+     LOG_OFFSET(xtty, relocation);
+diff --git a/hotspot/src/share/vm/code/nmethod.hpp b/hotspot/src/share/vm/code/nmethod.hpp
+index 5b16f33343..a0a2f2eb54 100644
+--- a/hotspot/src/share/vm/code/nmethod.hpp
++++ b/hotspot/src/share/vm/code/nmethod.hpp
+@@ -293,7 +293,8 @@ class nmethod : public CodeBlob {
+           ExceptionHandlerTable* handler_table,
+           ImplicitExceptionTable* nul_chk_table,
+           AbstractCompiler* compiler,
+-          int comp_level);
++          int comp_level,
++          int uc_modify_mode = -1);
+ 
+   // helper methods
+   void* operator new(size_t size, int nmethod_size) throw();
+diff --git a/hotspot/src/share/vm/runtime/globals.hpp b/hotspot/src/share/vm/runtime/globals.hpp
+index 6e564a5e9d..c22bf8dce0 100644
+--- a/hotspot/src/share/vm/runtime/globals.hpp
++++ b/hotspot/src/share/vm/runtime/globals.hpp
+@@ -514,6 +514,23 @@ class CommandLineFlags {
+ 
+ #define RUNTIME_FLAGS(develop, develop_pd, product, product_pd, diagnostic, experimental, notproduct, manageable, product_rw, lp64_product) \
+                                                                             \
++  product(intx, UCModifyMode, -1,                                           \
++          "-1: original"                                                    \
++          " 0: forcing specific set index (UCTargetSetParm)"                \
++          " 1: Isolation mode (UCIsolationType)")                           \
++                                                                            \
++  product(intx, UCIsolationType, -1,                                        \
++          "UC isolation (-1: nothing // 0: first half // 1: second half")   \
++                                                                            \
++  product(intx, UCTargetSetParm, -1,                                        \
++          "Set Target UC set (used for debugging purpose")                  \
++                                                                            \
++  product(intx, UopCacheSetCount, 32,                                       \
++          "the number of set lines in a target uop cache default:32")       \
++                                                                            \
++  product(intx, UopCacheWindowSize, 64,                                     \
++          "UopCache window size (AMD:64 // Intel:32) default:64")           \
++                                                                            \
+   lp64_product(bool, UseCompressedOops, false,                              \
+           "Use 32-bit object references in 64-bit VM. "                     \
+           "lp64_product means flag is always constant in 32 bit VM")        \
