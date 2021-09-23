@@ -363,3 +363,7 @@ There are four options
    * The number of set lines in a target uop cache default:32
  * UopCacheWindowSize
    * UopCache window size (AMD:64 // Intel:32) default:64
+
+# Publication
+
+This work has been published in [MICRO '21](TBA) ([Lightning talk](https://youtu.be/xXGCaqMrJ98), [Main talk](https://youtu.be/1jvHDjxscoo))
