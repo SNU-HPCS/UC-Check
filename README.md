@@ -366,4 +366,4 @@ There are four options
 
 # Publication
 
-This work has been published in [MICRO '21](TBA) ([Lightning talk](https://youtu.be/xXGCaqMrJ98), [Main talk](https://youtu.be/1jvHDjxscoo))
+This work has been published in [MICRO '21](https://dl.acm.org/doi/10.1145/3466752.3480079) ([Lightning talk](https://youtu.be/xXGCaqMrJ98), [Main talk](https://youtu.be/1jvHDjxscoo))
